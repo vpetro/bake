@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+REVIEW_ID_PATTERN = re.compile(r"-[0-9a-f]{10}$")
+DEFAULT_BRANCH_PREFIX = "petroverkhogliad/"
+
+
+def invoke(command, cwd=None, check=True):
+    result = subprocess.run(
+        [str(value) for value in command],
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if check and result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or f"command failed: {' '.join(map(str, command))}"
+        raise RuntimeError(message)
+    return result
+
+
+def git(repo, *args, check=True):
+    return invoke(["git", *args], cwd=repo, check=check)
+
+
+def current_toplevel(path):
+    result = invoke(["git", "rev-parse", "--show-toplevel"], cwd=path)
+    return Path(result.stdout.strip()).resolve()
+
+
+def main_worktree(repo):
+    result = git(repo, "worktree", "list", "--porcelain")
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            return Path(line.removeprefix("worktree ")).resolve()
+    raise RuntimeError("could not determine the main worktree")
+
+
+def worktrees_root(main):
+    return main / ".local" / "worktrees"
+
+
+def default_base(repo):
+    result = git(repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD", check=False)
+    if result.returncode == 0 and result.stdout.strip().startswith("origin/"):
+        return result.stdout.strip().removeprefix("origin/")
+    for candidate in ("main", "master"):
+        if git(repo, "rev-parse", "--verify", "--quiet", f"refs/heads/{candidate}", check=False).returncode == 0:
+            return candidate
+    raise RuntimeError("could not determine a base branch; pass --base")
+
+
+def slug(value):
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-.")
+    if not cleaned:
+        raise RuntimeError(f"cannot derive a worktree name from: {value}")
+    return cleaned[:60]
+
+
+def load_config(worktree):
+    path = Path(worktree) / ".pie.json"
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"invalid .pie.json: {error}")
+
+
+def in_tmux():
+    return bool(os.environ.get("TMUX"))
+
+
+def tmux(*args, check=True):
+    return invoke(["tmux", *args], check=check)
+
+
+def window_names():
+    result = tmux("list-windows", "-F", "#{window_name}", check=False)
+    return set(result.stdout.splitlines()) if result.returncode == 0 else set()
+
+
+def resolve_start_ref(main, base):
+    fetch = git(main, "fetch", "origin", base, check=False)
+    warnings = []
+    if fetch.returncode != 0:
+        warnings.append(f"fetch of origin/{base} failed; using local refs")
+    for ref in (f"refs/remotes/origin/{base}", f"refs/heads/{base}"):
+        if git(main, "rev-parse", "--verify", "--quiet", ref, check=False).returncode == 0:
+            return ref, warnings
+    raise RuntimeError(f"base ref not found locally or on origin: {base}")
+
+
+def copy_config_entries(main, worktree, patterns):
+    copied = []
+    for pattern in patterns:
+        for source in sorted(Path(main).glob(pattern)):
+            relative = source.relative_to(main)
+            target = Path(worktree) / relative
+            if target.exists():
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if source.is_dir():
+                shutil.copytree(source, target)
+            else:
+                shutil.copy2(source, target)
+            copied.append(str(relative))
+    return copied
+
+
+def run_config_commands(worktree, commands):
+    for command in commands:
+        print(f"run: {command}")
+        result = subprocess.run(command, cwd=worktree, shell=True)
+        if result.returncode != 0:
+            print(f"warning: setup command exited {result.returncode}: {command}", file=sys.stderr)
+
+
+def move_changes(source_top, worktree, name):
+    status = git(source_top, "status", "--porcelain").stdout.strip()
+    if not status:
+        return "no uncommitted changes to move"
+    git(source_top, "stash", "push", "-u", "-m", f"pie/{name}")
+    apply_result = git(worktree, "stash", "apply", check=False)
+    if apply_result.returncode != 0:
+        return "stash apply failed; changes are preserved in the stash (git stash list)"
+    git(worktree, "stash", "drop")
+    return "moved uncommitted changes into the worktree"
+
+
+def open_window(name, path, command=None):
+    result = tmux("new-window", "-P", "-F", "#{window_id}", "-n", name, "-c", str(path))
+    window_id = result.stdout.strip()
+    if command:
+        tmux("send-keys", "-t", window_id, command, "Enter")
+    return window_id
+
+
+def new(args):
+    top = current_toplevel(os.getcwd())
+    main = main_worktree(top)
+    name = slug(args.name)
+    path = worktrees_root(main) / name
+    if path.exists():
+        raise RuntimeError(f"worktree already exists: {path}")
+    branch = args.branch or f"{DEFAULT_BRANCH_PREFIX}{name}"
+    if git(main, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0:
+        raise RuntimeError(f"branch already exists: {branch}")
+    base = args.base or default_base(main)
+    start_ref, warnings = resolve_start_ref(main, base)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    git(main, "worktree", "add", "-b", branch, str(path), start_ref)
+    notes = list(warnings)
+    if args.with_changes:
+        notes.append(move_changes(top, path, name))
+    config = load_config(path)
+    copied = copy_config_entries(main, path, config.get("copy") or [])
+    if copied:
+        notes.append(f"copied: {', '.join(copied)}")
+    run_config_commands(path, config.get("run") or [])
+    window = None
+    if in_tmux() and not args.no_window:
+        pi_command = f"pi {shlex.quote(args.prompt)}" if args.prompt else "pi"
+        window = open_window(name, path, pi_command)
+    print(f"worktree: {path}")
+    print(f"branch:   {branch} (from {start_ref})")
+    for note in notes:
+        print(f"note:     {note}")
+    if window:
+        print(f"window:   {name} ({window}) running pi")
+    else:
+        print(f"next:     cd {path} && pi")
+
+
+def list_worktrees(args):
+    main = main_worktree(current_toplevel(os.getcwd()))
+    root = worktrees_root(main)
+    result = git(main, "worktree", "list", "--porcelain")
+    entries = []
+    current = {}
+    for line in result.stdout.splitlines() + [""]:
+        if not line:
+            if current:
+                entries.append(current)
+            current = {}
+        elif line.startswith("worktree "):
+            current["path"] = Path(line.removeprefix("worktree "))
+        elif line.startswith("branch "):
+            current["branch"] = line.removeprefix("branch refs/heads/")
+        elif line == "detached":
+            current["branch"] = "(detached)"
+    windows = window_names() if in_tmux() else set()
+    rows = []
+    for entry in entries:
+        path = entry.get("path")
+        if not path or root not in path.parents:
+            continue
+        name = path.name
+        dirty = bool(git(path, "status", "--porcelain", check=False).stdout.strip())
+        kind = "review" if REVIEW_ID_PATTERN.search(name) else "work"
+        rows.append((name, entry.get("branch", "?"), kind, dirty, name in windows))
+    if not rows:
+        print(f"no worktrees under {root}")
+        return
+    width = max(len(row[0]) for row in rows)
+    for name, branch, kind, dirty, has_window in sorted(rows):
+        flags = ",".join(filter(None, [kind, "dirty" if dirty else "", "window" if has_window else ""]))
+        print(f"{name:<{width}}  {flags:<20}  {branch}")
+
+
+def open_worktree(args):
+    main = main_worktree(current_toplevel(os.getcwd()))
+    name = slug(args.name)
+    path = worktrees_root(main) / name
+    if not path.exists():
+        raise RuntimeError(f"worktree not found: {path}")
+    if not in_tmux():
+        print(f"cd {path}")
+        return
+    if name in window_names():
+        tmux("select-window", "-t", name)
+        print(f"switched to window {name}")
+    else:
+        window = open_window(name, path)
+        print(f"window:   {name} ({window})")
+        print("hint:     pi -c resumes the last session for this directory")
+
+
+def remove(args, delete_branch=False):
+    main = main_worktree(current_toplevel(os.getcwd()))
+    name = slug(args.name)
+    path = worktrees_root(main) / name
+    if not path.exists():
+        raise RuntimeError(f"worktree not found: {path}")
+    status = git(path, "status", "--porcelain", check=False).stdout.strip()
+    if status and not args.force:
+        raise RuntimeError(f"worktree has changes; commit them or rerun with --force:\n{status}")
+    branch_result = git(path, "rev-parse", "--abbrev-ref", "HEAD", check=False)
+    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+    if in_tmux() and name in window_names():
+        tmux("kill-window", "-t", name, check=False)
+    command = ["worktree", "remove"]
+    if args.force:
+        command.append("--force")
+    git(main, *command, str(path))
+    print(f"removed:  {path}")
+    if delete_branch and branch and branch not in {"HEAD", "main", "master"}:
+        base = default_base(main)
+        if branch == base:
+            print(f"kept branch {branch} (base branch)")
+        else:
+            git(main, "branch", "-D", branch)
+            print(f"deleted:  branch {branch}")
+    elif branch and branch != "HEAD":
+        print(f"kept:     branch {branch}")
+
+
+def done(args):
+    remove(args, delete_branch=True)
+
+
+def parser():
+    root = argparse.ArgumentParser(prog="pie", description="git worktree + tmux window + pi launcher")
+    subparsers = root.add_subparsers(dest="command", required=True)
+    new_parser = subparsers.add_parser("new", aliases=["add"], help="create a worktree, branch, and tmux window running pi")
+    new_parser.add_argument("name")
+    new_parser.add_argument("--base")
+    new_parser.add_argument("--branch")
+    new_parser.add_argument("--prompt", "-p")
+    new_parser.add_argument("--with-changes", action="store_true")
+    new_parser.add_argument("--no-window", action="store_true")
+    new_parser.set_defaults(handler=new)
+    ls_parser = subparsers.add_parser("ls", aliases=["list"], help="list worktrees under .local/worktrees")
+    ls_parser.set_defaults(handler=list_worktrees)
+    open_parser = subparsers.add_parser("open", help="switch to or recreate the tmux window for a worktree")
+    open_parser.add_argument("name")
+    open_parser.set_defaults(handler=open_worktree)
+    rm_parser = subparsers.add_parser("rm", aliases=["remove"], help="remove a worktree and its window, keep the branch")
+    rm_parser.add_argument("name")
+    rm_parser.add_argument("--force", action="store_true")
+    rm_parser.set_defaults(handler=remove)
+    done_parser = subparsers.add_parser("done", help="remove a worktree, its window, and its branch")
+    done_parser.add_argument("name")
+    done_parser.add_argument("--force", action="store_true")
+    done_parser.set_defaults(handler=done)
+    return root
+
+
+def main():
+    args = parser().parse_args()
+    try:
+        args.handler(args)
+    except RuntimeError as error:
+        print(f"pie: {error}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
