@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 
 REVIEW_ID_PATTERN = re.compile(r"-[0-9a-f]{10}$")
-DEFAULT_BRANCH_PREFIX = "petroverkhogliad/"
+DEFAULT_BRANCH_PREFIX = "petro/"
 
 
 def invoke(command, cwd=None, check=True):

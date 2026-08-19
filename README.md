@@ -7,7 +7,7 @@ machine's conventions.
 
 Worktrees live in `<repo>/.local/worktrees/<name>` (the same convention the
 pr-review system uses for its review worktrees) and branches default to
-`petroverkhogliad/<name>`.
+`petro/<name>`.
 
 ## Commands
 
