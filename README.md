@@ -11,10 +11,12 @@ pr-review system uses for its review worktrees) and branches default to
 
 ## Commands
 
-- `bake new <name> [--prompt "..."] [--base X] [--branch Y] [--with-changes] [--no-window]`
+- `bake new <name> [--prompt "..." | --prompt-file F] [--base X] [--branch Y] [--with-changes] [--no-window]`
   Fetch the base branch, create the worktree and branch, run setup from
   `.bake.json`, open a tmux window there running pi (seeded with `--prompt`
-  when given). `--with-changes` moves uncommitted changes (including
+  when given). `--prompt-file` (`-P`) passes the file to pi as an `@file`
+  argument, so pi reads it at startup; `-` spools stdin to a temp file first.
+  With `--no-window`, the printed `next:` command carries the prompt. `--with-changes` moves uncommitted changes (including
   untracked files) from the current checkout into the new worktree via the
   stash; on conflict the stash is preserved. `--no-window` skips tmux, for
   agents or scripts.

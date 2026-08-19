@@ -8,6 +8,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REVIEW_ID_PATTERN = re.compile(r"-[0-9a-f]{10}$")
@@ -137,6 +138,28 @@ def move_changes(source_top, worktree, name):
     return "moved uncommitted changes into the worktree"
 
 
+def pi_command(args):
+    if args.prompt_file:
+        if args.prompt_file == "-":
+            text = sys.stdin.read().strip()
+            if not text:
+                raise RuntimeError("prompt file is empty")
+            fd, tmp = tempfile.mkstemp(prefix="bake-prompt-", suffix=".md")
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(text + "\n")
+            prompt_path = Path(tmp)
+        else:
+            prompt_path = Path(args.prompt_file).expanduser().resolve()
+            if not prompt_path.is_file():
+                raise RuntimeError(f"prompt file not found: {prompt_path}")
+            if not prompt_path.read_text(encoding="utf-8").strip():
+                raise RuntimeError("prompt file is empty")
+        return f"pi @{shlex.quote(str(prompt_path))}"
+    if args.prompt:
+        return f"pi {shlex.quote(args.prompt)}"
+    return "pi"
+
+
 def open_window(name, path, command=None):
     result = tmux("new-window", "-P", "-F", "#{window_id}", "-n", name, "-c", str(path))
     window_id = result.stdout.strip()
@@ -146,6 +169,7 @@ def open_window(name, path, command=None):
 
 
 def new(args):
+    command = pi_command(args)
     top = current_toplevel(os.getcwd())
     main = main_worktree(top)
     name = slug(args.name)
@@ -169,8 +193,7 @@ def new(args):
     run_config_commands(path, config.get("run") or [])
     window = None
     if in_tmux() and not args.no_window:
-        pi_command = f"pi {shlex.quote(args.prompt)}" if args.prompt else "pi"
-        window = open_window(name, path, pi_command)
+        window = open_window(name, path, command)
     print(f"worktree: {path}")
     print(f"branch:   {branch} (from {start_ref})")
     for note in notes:
@@ -178,7 +201,7 @@ def new(args):
     if window:
         print(f"window:   {name} ({window}) running pi")
     else:
-        print(f"next:     cd {path} && pi")
+        print(f"next:     cd {path} && {command}")
 
 
 def list_worktrees(args):
@@ -275,7 +298,9 @@ def parser():
     new_parser.add_argument("name")
     new_parser.add_argument("--base")
     new_parser.add_argument("--branch")
-    new_parser.add_argument("--prompt", "-p")
+    prompt_group = new_parser.add_mutually_exclusive_group()
+    prompt_group.add_argument("--prompt", "-p")
+    prompt_group.add_argument("--prompt-file", "-P")
     new_parser.add_argument("--with-changes", action="store_true")
     new_parser.add_argument("--no-window", action="store_true")
     new_parser.set_defaults(handler=new)
