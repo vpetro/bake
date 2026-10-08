@@ -13,6 +13,7 @@ from pathlib import Path
 
 REVIEW_ID_PATTERN = re.compile(r"-[0-9a-f]{10}$")
 DEFAULT_BRANCH_PREFIX = "petro/"
+DEFAULT_MODEL = "anthropic/claude-fable-5-1:max"
 
 
 def invoke(command, cwd=None, check=True):
@@ -138,9 +139,12 @@ def move_changes(source_top, worktree, name):
     return "moved uncommitted changes into the worktree"
 
 
-def pi_command(args):
-    if args.prompt_file:
-        if args.prompt_file == "-":
+def pi_command(model, prompt=None, prompt_file=None):
+    if not model or not model.strip():
+        raise RuntimeError("model selector is empty")
+    command = ["pi", "--model", model]
+    if prompt_file:
+        if prompt_file == "-":
             text = sys.stdin.read().strip()
             if not text:
                 raise RuntimeError("prompt file is empty")
@@ -149,15 +153,15 @@ def pi_command(args):
                 handle.write(text + "\n")
             prompt_path = Path(tmp)
         else:
-            prompt_path = Path(args.prompt_file).expanduser().resolve()
+            prompt_path = Path(prompt_file).expanduser().resolve()
             if not prompt_path.is_file():
                 raise RuntimeError(f"prompt file not found: {prompt_path}")
             if not prompt_path.read_text(encoding="utf-8").strip():
                 raise RuntimeError("prompt file is empty")
-        return f"pi @{shlex.quote(str(prompt_path))}"
-    if args.prompt:
-        return f"pi {shlex.quote(args.prompt)}"
-    return "pi"
+        command.append(f"@{prompt_path}")
+    elif prompt:
+        command.append(prompt)
+    return shlex.join(command)
 
 
 def open_window(name, path, command=None):
@@ -169,7 +173,7 @@ def open_window(name, path, command=None):
 
 
 def new(args):
-    command = pi_command(args)
+    command = pi_command(args.model, args.prompt, args.prompt_file)
     top = current_toplevel(os.getcwd())
     main = main_worktree(top)
     name = slug(args.name)
@@ -301,6 +305,7 @@ def parser():
     prompt_group = new_parser.add_mutually_exclusive_group()
     prompt_group.add_argument("--prompt", "-p")
     prompt_group.add_argument("--prompt-file", "-P")
+    new_parser.add_argument("--model", default=DEFAULT_MODEL, help="pi model selector, provider/id[:thinking] (default: %(default)s)")
     new_parser.add_argument("--with-changes", action="store_true")
     new_parser.add_argument("--no-window", action="store_true")
     new_parser.set_defaults(handler=new)
