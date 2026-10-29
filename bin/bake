@@ -1,19 +1,43 @@
 #!/usr/bin/env python3
 
 import argparse
+import contextlib
 import json
 import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+from collections import namedtuple
 from pathlib import Path
 
 REVIEW_ID_PATTERN = re.compile(r"-[0-9a-f]{10}$")
 DEFAULT_BRANCH_PREFIX = "petro/"
 DEFAULT_MODEL = "anthropic/claude-fable-5-1:max"
+INPUT_DIR_NAME = "bake"
+BRIEF_FILE = "brief.md"
+REPORTING_FILE = "reporting.md"
+RESULT_FILE = "result.md"
+REPORTING_TEXT = """# Report to the originating chat
+
+Use the task brief's completion criteria. When the assigned work is
+finished, call bake_report with status completed, a short summary, and the
+evidence paths. State what was verified and what remains unverified. If you
+need a decision before continuing, use status blocked and state the decision.
+If the task cannot be finished, use status failed. Reporting completion does
+not authorize merging, publishing, or deploying.
+
+Use the monitor associated with this worktree (`{worktree}`). Do not guess a
+task id or choose between ambiguous monitors. If no monitor is registered, the
+reporting tool is unavailable, or the report is rejected, save the outcome and
+evidence to the task's ledger or to the result file `{result}` and state that
+delivery failed. Do not claim that the originating chat was notified.
+"""
+
+Brief = namedtuple("Brief", "path text")
 
 
 def invoke(command, cwd=None, check=True):
@@ -139,29 +163,78 @@ def move_changes(source_top, worktree, name):
     return "moved uncommitted changes into the worktree"
 
 
-def pi_command(model, prompt=None, prompt_file=None):
+def check_model(model):
     if not model or not model.strip():
         raise RuntimeError("model selector is empty")
-    command = ["pi", "--model", model]
+
+
+def load_brief(prompt=None, prompt_file=None):
+    if prompt_file == "-":
+        text = sys.stdin.read()
+        if not text.strip():
+            raise RuntimeError("prompt file is empty: stdin")
+        return Brief(None, text)
     if prompt_file:
-        if prompt_file == "-":
-            text = sys.stdin.read().strip()
-            if not text:
-                raise RuntimeError("prompt file is empty")
-            fd, tmp = tempfile.mkstemp(prefix="bake-prompt-", suffix=".md")
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(text + "\n")
-            prompt_path = Path(tmp)
-        else:
-            prompt_path = Path(prompt_file).expanduser().resolve()
-            if not prompt_path.is_file():
-                raise RuntimeError(f"prompt file not found: {prompt_path}")
-            if not prompt_path.read_text(encoding="utf-8").strip():
-                raise RuntimeError("prompt file is empty")
-        command.append(f"@{prompt_path}")
-    elif prompt:
-        command.append(prompt)
-    return shlex.join(command)
+        path = Path(prompt_file).expanduser().resolve()
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            raise RuntimeError(f"prompt file not found: {path}") from None
+        except OSError as error:
+            raise RuntimeError(f"prompt file is not readable: {path} ({error.strerror})") from None
+        if not stat.S_ISREG(info.st_mode):
+            raise RuntimeError(f"prompt file is not a regular file: {path}")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            raise RuntimeError(f"prompt file is not UTF-8 text: {path}") from None
+        except OSError as error:
+            raise RuntimeError(f"prompt file is not readable: {path} ({error.strerror})") from None
+        if not text.strip():
+            raise RuntimeError(f"prompt file is empty: {path}")
+        return Brief(path, text)
+    if prompt is not None:
+        if not prompt.strip():
+            raise RuntimeError("prompt is empty")
+        return Brief(None, prompt)
+    return None
+
+
+def input_dir(main, name):
+    return Path(main) / ".local" / INPUT_DIR_NAME / name
+
+
+def write_private(path, text):
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def prepare_input(main, name, worktree, brief):
+    folder = input_dir(main, name)
+    if folder.is_dir():
+        shutil.rmtree(folder)
+    folder.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    folder.mkdir(mode=0o700)
+    if brief.path:
+        brief_path = brief.path
+    else:
+        brief_path = folder / BRIEF_FILE
+        write_private(brief_path, brief.text if brief.text.endswith("\n") else brief.text + "\n")
+    reporting = folder / REPORTING_FILE
+    write_private(reporting, REPORTING_TEXT.format(worktree=worktree, result=folder / RESULT_FILE))
+    return folder, [brief_path, reporting]
+
+
+def pi_command(model, files=()):
+    check_model(model)
+    return shlex.join(["pi", "--model", model, *(f"@{file}" for file in files)])
 
 
 def open_window(name, path, command=None):
@@ -173,7 +246,8 @@ def open_window(name, path, command=None):
 
 
 def new(args):
-    command = pi_command(args.model, args.prompt, args.prompt_file)
+    check_model(args.model)
+    brief = load_brief(args.prompt, args.prompt_file)
     top = current_toplevel(os.getcwd())
     main = main_worktree(top)
     name = slug(args.name)
@@ -195,6 +269,8 @@ def new(args):
     if copied:
         notes.append(f"copied: {', '.join(copied)}")
     run_config_commands(path, config.get("run") or [])
+    folder, files = prepare_input(main, name, path, brief) if brief else (None, [])
+    command = pi_command(args.model, files)
     window = None
     if in_tmux() and not args.no_window:
         window = open_window(name, path, command)
@@ -202,6 +278,8 @@ def new(args):
     print(f"branch:   {branch} (from {start_ref})")
     for note in notes:
         print(f"note:     {note}")
+    if folder:
+        print(f"input:    {folder}")
     if window:
         print(f"window:   {name} ({window}) running pi")
     else:
@@ -280,6 +358,10 @@ def remove(args, delete_branch=False):
         command.append("--force")
     git(main, *command, str(path))
     print(f"removed:  {path}")
+    folder = input_dir(main, name)
+    if folder.is_dir():
+        shutil.rmtree(folder)
+        print(f"removed:  {folder}")
     if delete_branch and branch and branch not in {"HEAD", "main", "master"}:
         base = default_base(main)
         if branch == base:
