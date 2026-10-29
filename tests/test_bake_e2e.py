@@ -98,7 +98,7 @@ def mode(path):
 
 
 class Harness:
-    def __init__(self, root):
+    def __init__(self, root, ignore_local=True):
         self.root = Path(root).resolve()
         self.home = self.root / "home"
         self.repo = self.root / "repo"
@@ -114,6 +114,10 @@ class Harness:
         (self.repo / "README.md").write_text("# demo\n", encoding="utf-8")
         self.git("add", "README.md")
         self.git("commit", "-q", "-m", "initial")
+        if ignore_local:
+            self.ignore_local()
+
+    def ignore_local(self):
         exclude = self.repo / ".git" / "info" / "exclude"
         exclude.parent.mkdir(exist_ok=True)
         with exclude.open("a", encoding="utf-8") as handle:
@@ -309,10 +313,26 @@ class EndToEndTests(unittest.TestCase):
         self.assertEqual(record["files"], [str(brief.resolve()), str(self.h.folder.resolve() / "reporting.md")])
         self.assertIn("Do the thing.", record["prompt"])
 
-    def test_rm_removes_the_worktree_and_its_input_dir(self):
+    def test_rm_keeps_a_saved_result_until_it_is_moved_away(self):
         self.assertEqual(self.h.bake("new", "feature", "-p", "Do it.").returncode, 0)
-        (self.h.folder / "result.md").write_text("delivery failed; outcome here\n", encoding="utf-8")
+        saved = self.h.folder / "result.md"
+        saved.write_text("delivery failed; outcome here\n", encoding="utf-8")
+        calls_after_launch = len(self.h.tmux_calls())
+        message = f"bake: Saved worker result exists: {self.h.folder.resolve() / 'result.md'}. Preserve it before removing or reusing this bake.\n"
 
+        for extra in ((), ("--force",)):
+            with self.subTest(extra=extra):
+                refused = self.h.bake("rm", "feature", *extra)
+                self.assertEqual(refused.returncode, 1)
+                self.assertEqual(refused.stderr, message)
+                self.assertEqual(refused.stdout, "")
+        self.assertEqual(len(self.h.tmux_calls()), calls_after_launch)
+        self.assertTrue(self.h.worktree.is_dir())
+        self.assertEqual(self.h.git("worktree", "list", "--porcelain").count("worktree "), 2)
+        self.assertEqual(sorted(path.name for path in self.h.folder.iterdir()), ["brief.md", "reporting.md", "result.md"])
+        self.assertEqual(saved.read_text(encoding="utf-8"), "delivery failed; outcome here\n")
+
+        saved.rename(self.h.root / "feature-result.md")
         result = self.h.bake("rm", "feature")
 
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -322,6 +342,191 @@ class EndToEndTests(unittest.TestCase):
         self.assertFalse(self.h.worktree.exists())
         self.assertFalse(self.h.folder.exists())
         self.assertEqual(self.h.git("worktree", "list", "--porcelain").count("worktree "), 1)
+        self.assertEqual((self.h.root / "feature-result.md").read_text(encoding="utf-8"), "delivery failed; outcome here\n")
+
+    def test_saved_result_blocks_reusing_the_name_until_it_is_moved_away(self):
+        self.assertEqual(self.h.bake("new", "feature", "-p", "First task.").returncode, 0)
+        saved = self.h.folder / "result.md"
+        saved.write_text("delivery failed; outcome here\n", encoding="utf-8")
+        self.h.git("worktree", "remove", "--force", str(self.h.worktree))
+        self.h.git("branch", "-D", "petro/feature")
+        calls_after_launch = len(self.h.tmux_calls())
+        self.h.record.unlink()
+
+        refused = self.h.bake("new", "feature", "-p", "Second task.")
+
+        self.assertEqual(refused.returncode, 1)
+        self.assertEqual(
+            refused.stderr,
+            f"bake: Saved worker result exists: {self.h.folder.resolve() / 'result.md'}. Preserve it before removing or reusing this bake.\n",
+        )
+        self.assertEqual(refused.stdout, "")
+        self.assertEqual(len(self.h.tmux_calls()), calls_after_launch)
+        self.assertFalse(self.h.record.exists())
+        self.assertFalse(self.h.worktree.exists())
+        self.assertEqual(self.h.git("worktree", "list", "--porcelain").count("worktree "), 1)
+        self.assertEqual(self.h.git("branch", "--list", "petro/feature"), "")
+        self.assertEqual(sorted(path.name for path in self.h.folder.iterdir()), ["brief.md", "reporting.md", "result.md"])
+        self.assertEqual((self.h.folder / "brief.md").read_text(encoding="utf-8"), "First task.\n")
+        self.assertEqual(saved.read_text(encoding="utf-8"), "delivery failed; outcome here\n")
+
+        saved.rename(self.h.root / "feature-result.md")
+        result = self.h.bake("new", "feature", "-p", "Second task.")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(path.name for path in self.h.folder.iterdir()), ["brief.md", "reporting.md"])
+        self.assertEqual((self.h.folder / "brief.md").read_text(encoding="utf-8"), "Second task.\n")
+        self.assertIn("Second task.", self.h.pi_record()["prompt"])
+        self.assertTrue(self.h.worktree.is_dir())
+
+    def test_brief_inside_the_input_dir_is_rejected_and_kept(self):
+        inside = self.h.folder / "brief.md"
+        inside.parent.mkdir(parents=True)
+        inside.write_text("Brief left in the input directory.\n", encoding="utf-8")
+
+        result = self.h.bake("new", "feature", "-P", str(inside))
+
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(
+            result.stderr,
+            f"bake: Prompt file is inside the bake input directory: {inside.resolve()}. Move it outside that directory before starting this bake.\n",
+        )
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.h.tmux_calls(), [])
+        self.assertFalse(self.h.record.exists())
+        self.assertEqual(inside.read_text(encoding="utf-8"), "Brief left in the input directory.\n")
+        self.assertEqual([path.name for path in self.h.folder.iterdir()], ["brief.md"])
+        self.assertFalse((self.h.repo / ".local" / "worktrees").exists())
+        self.assertEqual(self.h.git("worktree", "list", "--porcelain").count("worktree "), 1)
+        self.assertEqual(self.h.git("branch", "--list", "petro/feature"), "")
+
+    def test_input_failure_leaves_no_worktree_and_the_same_command_works_after_the_fix(self):
+        blocker = self.h.repo / ".local" / "bake"
+        blocker.parent.mkdir()
+        blocker.write_text("not a directory\n", encoding="utf-8")
+
+        failed = self.h.bake("new", "feature", "-p", "Do it.")
+
+        self.assertEqual(failed.returncode, 1)
+        self.assertEqual(
+            failed.stderr,
+            f"bake: Could not prepare worker input: File exists: {blocker.resolve()}. No worker was started.\n",
+        )
+        self.assertEqual(failed.stdout, "")
+        self.assertEqual(self.h.tmux_calls(), [])
+        self.assertFalse(self.h.record.exists())
+        self.assertFalse((self.h.repo / ".local" / "worktrees").exists())
+        self.assertEqual(self.h.git("worktree", "list", "--porcelain").count("worktree "), 1)
+        self.assertEqual(self.h.git("branch", "--list", "petro/feature"), "")
+        self.assertEqual(blocker.read_text(encoding="utf-8"), "not a directory\n")
+
+        blocker.unlink()
+        result = self.h.bake("new", "feature", "-p", "Do it.")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("window:   feature (@42) running pi\n", result.stdout)
+        self.assertEqual([call[0] for call in self.h.tmux_calls()], ["new-window", "send-keys"])
+        self.assertIn("Do it.", self.h.pi_record()["prompt"])
+        self.assertEqual(sorted(path.name for path in self.h.folder.iterdir()), ["brief.md", "reporting.md"])
+        self.assert_clean_checkouts()
+
+
+class UnignoredLocalTests(unittest.TestCase):
+    REFUSAL = "bake: Bake input files must be ignored before using --with-changes. No changes were moved.\n"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.h = Harness(self.tmp.name, ignore_local=False)
+        (self.h.repo / "README.md").write_text("# demo\n\nedited\n", encoding="utf-8")
+        (self.h.repo / "notes.txt").write_text("scratch\n", encoding="utf-8")
+        plan = self.h.repo / ".local" / "plans" / "plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("plan\n", encoding="utf-8")
+        self.ignore = self.h.repo / ".local" / "bake" / ".gitignore"
+
+    def status(self, cwd=None):
+        return self.h.git("status", "--porcelain", "--untracked-files=all", cwd=cwd)
+
+    def assert_refused_without_side_effects(self, result, status_before):
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stderr, self.REFUSAL)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.h.tmux_calls(), [])
+        self.assertFalse(self.h.record.exists())
+        self.assertEqual(self.status(), status_before)
+        self.assertEqual(self.h.git("stash", "list"), "")
+        self.assertFalse((self.h.repo / ".local" / "worktrees").exists())
+        self.assertEqual(self.h.git("worktree", "list", "--porcelain").count("worktree "), 1)
+        self.assertEqual(self.h.git("branch", "--list", "petro/feature"), "")
+        self.assertEqual([path.name for path in self.ignore.parent.iterdir()], [".gitignore"])
+
+    def test_with_changes_moves_the_wip_but_not_the_generated_input(self):
+        result = self.h.bake("new", "feature", "-p", "Do it.", "--with-changes")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("note:     moved uncommitted changes into the worktree\n", result.stdout)
+        folder = self.h.folder.resolve()
+        self.assertEqual(sorted(path.name for path in folder.iterdir()), ["brief.md", "reporting.md"])
+        self.assertEqual(self.ignore.read_text(encoding="utf-8"), "*\n")
+        self.assertEqual(mode(self.ignore), 0o600)
+        record = self.h.pi_record()
+        self.assertEqual(record["files"], [str(folder / "brief.md"), str(folder / "reporting.md")])
+        self.assertIn(f'<file name="{folder / "brief.md"}">\nDo it.\n\n</file>\n', record["prompt"])
+        self.assertIn("# Report to the originating chat", record["prompt"])
+        self.assertEqual(record["cwd"], os.path.realpath(self.h.worktree))
+        self.assertEqual(len([call for call in self.h.tmux_calls() if call[0] == "send-keys"]), 1)
+        self.assertEqual(self.status(), "?? .local/worktrees/feature/\n")
+        self.assertEqual(self.status(cwd=self.h.worktree), " M README.md\n?? .local/plans/plan.md\n?? notes.txt\n")
+        self.assertEqual((self.h.worktree / "README.md").read_text(encoding="utf-8"), "# demo\n\nedited\n")
+        self.assertEqual((self.h.worktree / "notes.txt").read_text(encoding="utf-8"), "scratch\n")
+        self.assertFalse((self.h.worktree / ".local" / "bake").exists())
+        self.assertEqual(self.h.git("stash", "list"), "")
+
+    def test_with_changes_refuses_when_the_brief_would_move_and_works_once_it_is_ignored(self):
+        brief = self.h.repo / ".local" / "plans" / "briefs" / "feature.md"
+        brief.parent.mkdir()
+        brief.write_text("Read the ledger.\n", encoding="utf-8")
+        before = self.status()
+        self.assertIn("?? .local/plans/briefs/feature.md\n", before)
+
+        refused = self.h.bake("new", "feature", "-P", str(brief), "--with-changes")
+
+        self.assert_refused_without_side_effects(refused, before)
+        self.assertEqual(self.ignore.read_text(encoding="utf-8"), "*\n")
+        self.assertEqual(brief.read_text(encoding="utf-8"), "Read the ledger.\n")
+
+        self.h.ignore_local()
+        result = self.h.bake("new", "feature", "-P", str(brief), "--with-changes")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("note:     moved uncommitted changes into the worktree\n", result.stdout)
+        record = self.h.pi_record()
+        self.assertEqual(record["files"], [str(brief.resolve()), str(self.h.folder.resolve() / "reporting.md")])
+        self.assertIn("Read the ledger.", record["prompt"])
+        self.assertEqual(brief.read_text(encoding="utf-8"), "Read the ledger.\n")
+        self.assertEqual(self.status(), "")
+        self.assertEqual(self.status(cwd=self.h.worktree), " M README.md\n?? notes.txt\n")
+
+    def test_with_changes_refuses_when_an_existing_ignore_file_does_not_cover_the_input(self):
+        self.ignore.parent.mkdir()
+        self.ignore.write_text("", encoding="utf-8")
+        before = self.status()
+        self.assertIn("?? .local/bake/.gitignore\n", before)
+
+        refused = self.h.bake("new", "feature", "-p", "Do it.", "--with-changes")
+
+        self.assert_refused_without_side_effects(refused, before)
+        self.assertEqual(self.ignore.read_text(encoding="utf-8"), "")
+
+        self.ignore.unlink()
+        result = self.h.bake("new", "feature", "-p", "Do it.", "--with-changes")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.ignore.read_text(encoding="utf-8"), "*\n")
+        self.assertIn("Do it.", self.h.pi_record()["prompt"])
+        self.assertEqual(self.status(), "?? .local/worktrees/feature/\n")
+        self.assertEqual(self.status(cwd=self.h.worktree), " M README.md\n?? .local/plans/plan.md\n?? notes.txt\n")
 
 
 if __name__ == "__main__":

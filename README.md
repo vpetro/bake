@@ -13,11 +13,10 @@ pr-review system uses for its review worktrees) and branches default to
 
 - `bake new <name> [--prompt "..." | --prompt-file F] [--model SEL] [--base X] [--branch Y] [--with-changes] [--no-window]`
   Fetch the base branch, create the worktree and branch, run setup from
-  `.bake.json`, open a tmux window there running pi. The brief comes from
-  `--prompt` (`-p`), from `--prompt-file` (`-P`), or from stdin with `-P -`;
-  bake passes it to pi as an `@file` argument together with its reporting
-  instructions, so pi reads both at startup. See
-  [Worker input and reporting](#worker-input-and-reporting). `--model` picks
+  `.bake.json`, and start Pi in a separate tmux window. Supply the task with
+  `--prompt` (`-p`), `--prompt-file` (`-P`), or stdin through `-P -`.
+  Pi reads the brief and bake's reporting instructions from files at startup.
+  See [Worker input and reporting](#worker-input-and-reporting). `--model` picks
   the pi model selector; see [Model selection](#model-selection) for the
   default. With `--no-window`, the printed `next:` command includes the
   model and the files. `--with-changes` moves uncommitted changes (including
@@ -28,53 +27,63 @@ pr-review system uses for its review worktrees) and branches default to
   presence, and branch.
 - `bake open <name>` - switch to the worktree's window, recreating it if
   needed (`pi -c` inside resumes the last session for that directory).
-- `bake rm <name> [--force]` - kill the window, remove the worktree and its
-  `.local/bake/<name>` input directory; refuses when dirty unless forced.
-  Keeps the branch.
+- `bake rm <name> [--force]` - stop the window and remove the worktree and
+  its generated input directory, keeping the branch. Dirty worktrees require
+  `--force`. A saved `result.md` must be preserved elsewhere and removed from
+  the input directory first; `--force` does not bypass this check.
 - `bake done <name> [--force]` - `rm` plus delete the branch. For after the
   PR merges.
 
 ## Worker input and reporting
 
-Bake prepares the worker's input files from your task brief and its standard
-reporting instructions, then starts Pi with those files. You do not need to
-send a separate reporting prompt through tmux. The control chat registers the
-monitor with `bake_monitor`; bake does not create a monitor on its behalf.
-Define completion and the required evidence in your task brief. The worker
-reports completed, blocked, or failed through `bake_report`.
+Bake starts Pi with the task brief and a separate reporting file as `@file`
+arguments. Both become part of the first prompt. The worker gets its task
+and reporting instructions together; the control does not need to send a
+second message through tmux.
 
-The launch command is
+The control chat still registers the monitor with `bake_monitor` immediately
+after launch. Bake does not create monitor records or choose an owning
+session. The worker calls `bake_report` from its worktree without needing a
+task id sent to its pane. State the completion criteria and required evidence
+in the task brief; the generic reporting instructions do not decide what
+counts as finished.
 
-```
-pi --model anthropic/claude-fable-5-1:max @/path/to/brief.md @<repo>/.local/bake/<name>/reporting.md
-```
+Generated files are under `<repo>/.local/bake/<name>/`, shown as `input:` in
+the launch output:
 
-Pi includes each `@file` in the worker's first prompt, in that order, so the
-worker reads the brief and then the reporting instructions. Bake-written
-files live in `<repo>/.local/bake/<name>/`, beside the worktrees and under
-the same ignore rule; `bake new` prints the directory as `input:`.
+- `reporting.md` tells the worker to report completed, blocked, or failed,
+  with evidence and any unverified behavior.
+- `brief.md` holds inline or stdin input. For `--prompt-file`, bake instead
+  uses the resolved original path without changing or copying the file.
+  Keep that file available until Pi has read it.
+- `result.md` is a fallback the worker can write if reporting is unavailable
+  or the tool says the originating chat will not be notified. The worker
+  can use the task's ledger instead. Bake does not create this result or
+  automatically deliver it later.
 
-- `reporting.md` - the reporting instructions, naming this worktree and the
-  result file below. Written for every launch that has a brief.
-- `brief.md` - the brief text, written only for `--prompt` and `-P -`. A
-  `--prompt-file` path is passed to Pi as given and is never copied or
-  changed.
-- `result.md` - not created by bake. The reporting instructions tell the
-  worker to write its outcome here, or to the task's ledger, when no monitor
-  is registered, the reporting tool is missing, or the report is rejected.
+Bake writes private input files and creates `.local/bake/.gitignore` if
+missing so generated input stays out of Git. It leaves existing ignore files
+unchanged. With `--with-changes`, bake checks that transferring changes will
+not remove or revert the input Pi needs. It refuses before moving changes
+if a generated file or referenced brief would be affected. Keep a referenced
+brief outside the changes being transferred; a clean tracked brief can also
+remain in place.
 
-Register the monitor right after `bake new` returns. The worker binds to a
-monitor registered after launch on its next heartbeat, and `bake_report`
-looks the monitor up by worktree when it is called, so no task id has to
-reach the worker. A report made before any monitor exists is rejected, and
-the worker then writes `result.md` instead of claiming delivery.
+A monitor registered after launch is found by worktree when the worker
+reports. A report made before registration is rejected and must be saved
+locally instead. This remains a race: the fallback is not an automatic
+notification. Later updates to a running worker are not supported by this
+file-input flow; changing the original brief does not send a new message.
 
-Without `--prompt` or `--prompt-file` the worker starts bare
-(`pi --model <selector>`) and no files are written: there is no task to
-report on, and a reporting-only first prompt would start a model turn for
-nothing. A missing, unreadable, empty, or non-UTF-8 brief fails before the
-worktree or branch is created, and nothing is launched. `bake rm` and
-`bake done` remove the input directory with the worktree.
+Without a brief, bake starts Pi without an initial prompt or generated input.
+Invalid brief input fails before creating a branch or worktree. Input-file
+write failures also prevent the launch. A supplied brief inside this bake's
+own input directory is rejected so cleanup cannot delete it.
+
+`bake rm` and `bake done` remove the generated input directory, but refuse
+if it contains `result.md`, even with `--force`. Starting another bake with
+the same name has the same guard. Preserve the saved outcome elsewhere and
+remove that result file before retrying.
 
 ## Model selection
 
@@ -145,9 +154,8 @@ Standard-library `unittest`, no model and no network:
 python3 -m unittest discover -s tests -v
 ```
 
-`tests/test_bake.py` replaces git and tmux with a recorder and creates
-nothing outside a temp directory. `tests/test_bake_e2e.py` runs `bin/bake`
-as a process against a temporary git repository with fake `tmux` and `pi`
-executables on `PATH`; the fake tmux runs the launch command in the new
-window's directory and the fake pi records what it received, following Pi's
-`@file` handling.
+Unit tests replace Git and tmux calls with recorded operations. End-to-end
+tests run the CLI against temporary Git repositories with fake tmux and Pi
+executables. They check the files Pi receives, quoting, input validation,
+saved-result protection, and transfer of uncommitted changes. They do not
+launch real workers or make provider calls.

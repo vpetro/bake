@@ -21,6 +21,7 @@ INPUT_DIR_NAME = "bake"
 BRIEF_FILE = "brief.md"
 REPORTING_FILE = "reporting.md"
 RESULT_FILE = "result.md"
+IGNORE_FILE = ".gitignore"
 REPORTING_TEXT = """# Report to the originating chat
 
 Use the task brief's completion criteria. When the assigned work is
@@ -32,9 +33,10 @@ not authorize merging, publishing, or deploying.
 
 Use the monitor associated with this worktree (`{worktree}`). Do not guess a
 task id or choose between ambiguous monitors. If no monitor is registered, the
-reporting tool is unavailable, or the report is rejected, save the outcome and
-evidence to the task's ledger or to the result file `{result}` and state that
-delivery failed. Do not claim that the originating chat was notified.
+reporting tool is unavailable, the report is rejected, or the tool says the
+originating chat will not be notified, save the outcome and evidence to the
+task's ledger or to the result file `{result}` and state that delivery failed.
+Do not claim that the originating chat was notified.
 """
 
 Brief = namedtuple("Brief", "path text")
@@ -216,12 +218,27 @@ def write_private(path, text):
         raise
 
 
-def prepare_input(main, name, worktree, brief):
+def check_input(main, name, brief=None):
     folder = input_dir(main, name)
+    result = folder / RESULT_FILE
+    if result.exists():
+        raise RuntimeError(f"Saved worker result exists: {result}. Preserve it before removing or reusing this bake.")
+    if brief is not None and brief.path and folder in brief.path.parents:
+        raise RuntimeError(
+            f"Prompt file is inside the bake input directory: {brief.path}. Move it outside that directory before starting this bake."
+        )
+    return folder
+
+
+def prepare_input(main, name, worktree, brief):
+    folder = check_input(main, name, brief)
     if folder.is_dir():
         shutil.rmtree(folder)
     folder.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     folder.mkdir(mode=0o700)
+    ignore = folder.parent / IGNORE_FILE
+    if not ignore.exists():
+        write_private(ignore, "*\n")
     if brief.path:
         brief_path = brief.path
     else:
@@ -230,6 +247,12 @@ def prepare_input(main, name, worktree, brief):
     reporting = folder / REPORTING_FILE
     write_private(reporting, REPORTING_TEXT.format(worktree=worktree, result=folder / RESULT_FILE))
     return folder, [brief_path, reporting]
+
+
+def check_ignored(top, files):
+    inside = [f":(literal){file.relative_to(top)}" for file in files if file.is_relative_to(top)]
+    if inside and git(top, "status", "--porcelain", "--untracked-files=all", "--", *inside).stdout.strip():
+        raise RuntimeError("Bake input files must be ignored before using --with-changes. No changes were moved.")
 
 
 def pi_command(model, files=()):
@@ -257,10 +280,26 @@ def new(args):
     branch = args.branch or f"{DEFAULT_BRANCH_PREFIX}{name}"
     if git(main, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0:
         raise RuntimeError(f"branch already exists: {branch}")
+    check_input(main, name, brief)
     base = args.base or default_base(main)
     start_ref, warnings = resolve_start_ref(main, base)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    git(main, "worktree", "add", "-b", branch, str(path), start_ref)
+    try:
+        folder, files = prepare_input(main, name, path, brief) if brief else (None, [])
+    except OSError as error:
+        reason = error.strerror or str(error)
+        if error.filename:
+            reason = f"{reason}: {error.filename}"
+        raise RuntimeError(f"Could not prepare worker input: {reason}. No worker was started.") from None
+    command = pi_command(args.model, files)
+    try:
+        if args.with_changes:
+            check_ignored(top, files)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        git(main, "worktree", "add", "-b", branch, str(path), start_ref)
+    except BaseException:
+        if folder:
+            shutil.rmtree(folder, ignore_errors=True)
+        raise
     notes = list(warnings)
     if args.with_changes:
         notes.append(move_changes(top, path, name))
@@ -269,8 +308,6 @@ def new(args):
     if copied:
         notes.append(f"copied: {', '.join(copied)}")
     run_config_commands(path, config.get("run") or [])
-    folder, files = prepare_input(main, name, path, brief) if brief else (None, [])
-    command = pi_command(args.model, files)
     window = None
     if in_tmux() and not args.no_window:
         window = open_window(name, path, command)
@@ -346,6 +383,7 @@ def remove(args, delete_branch=False):
     path = worktrees_root(main) / name
     if not path.exists():
         raise RuntimeError(f"worktree not found: {path}")
+    folder = check_input(main, name)
     status = git(path, "status", "--porcelain", check=False).stdout.strip()
     if status and not args.force:
         raise RuntimeError(f"worktree has changes; commit them or rerun with --force:\n{status}")
@@ -358,7 +396,6 @@ def remove(args, delete_branch=False):
         command.append("--force")
     git(main, *command, str(path))
     print(f"removed:  {path}")
-    folder = input_dir(main, name)
     if folder.is_dir():
         shutil.rmtree(folder)
         print(f"removed:  {folder}")

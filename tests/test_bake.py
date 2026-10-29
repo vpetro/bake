@@ -1,4 +1,5 @@
 import contextlib
+import errno
 import importlib.machinery
 import importlib.util
 import io
@@ -29,21 +30,32 @@ NASTY = "fix it's \"quoted\" $HOME `date` ; rm -rf / && echo\n\nsecond line\twit
 class FakeInvoke:
     def __init__(self, main, window_id="@7", windows=""):
         self.main = str(main)
+        self.top = None
         self.window_id = window_id
         self.windows = windows
+        self.tree_status = ""
+        self.input_status = ""
+        self.failing = []
         self.calls = []
+        self.cwds = []
 
     def __call__(self, command, cwd=None, check=True):
         command = [str(value) for value in command]
         self.calls.append(command)
-        returncode, stdout = self.respond(command)
+        self.cwds.append(None if cwd is None else str(cwd))
+        if any(command[: len(prefix)] == prefix for prefix in self.failing):
+            returncode, stdout = 1, ""
+        else:
+            returncode, stdout = self.respond(command)
         if check and returncode != 0:
             raise RuntimeError(f"fake command failed: {' '.join(command)}")
         return subprocess.CompletedProcess(command, returncode, stdout, "")
 
     def respond(self, command):
         if command[:2] == ["git", "rev-parse"] and "--show-toplevel" in command:
-            return 0, f"{self.main}\n"
+            return 0, f"{self.top or self.main}\n"
+        if command[:3] == ["git", "status", "--porcelain"]:
+            return 0, self.input_status if "--" in command else self.tree_status
         if command[:3] == ["git", "worktree", "list"]:
             return 0, f"worktree {self.main}\nHEAD 0000\nbranch refs/heads/main\n\n"
         if command[:3] == ["git", "rev-parse", "--verify"]:
@@ -257,6 +269,12 @@ class InputTests(unittest.TestCase):
             "Do not claim that the originating chat was notified.",
         ):
             self.assertIn(phrase, text)
+        self.assertIn(
+            "If no monitor is registered, the reporting tool is unavailable, the report is rejected, or the tool says the"
+            " originating chat will not be notified, save the outcome and evidence to the task's ledger or to the result"
+            f" file `{self.folder / 'result.md'}` and state that delivery failed.",
+            " ".join(text.split()),
+        )
         self.assertNotIn("{", text)
         self.assertFalse((self.folder / "result.md").exists())
 
@@ -268,14 +286,60 @@ class InputTests(unittest.TestCase):
             self.assertEqual(mode(path), 0o600)
         self.assertEqual([path.name for path in folder.iterdir() if path.name.startswith(".")], [])
 
-    def test_leftover_input_dir_is_replaced(self):
+    def test_leftover_input_dir_without_a_result_is_replaced(self):
         self.folder.mkdir(parents=True)
-        (self.folder / "result.md").write_text("stale outcome\n", encoding="utf-8")
         (self.folder / "brief.md").write_text("stale brief\n", encoding="utf-8")
+        (self.folder / "reporting.md").write_text("stale reporting\n", encoding="utf-8")
         brief = self.main / "brief.md"
         brief.write_text("fresh brief\n", encoding="utf-8")
         bake.prepare_input(self.main, "feature", self.worktree, bake.Brief(brief, "fresh brief\n"))
         self.assertEqual([path.name for path in self.folder.iterdir()], ["reporting.md"])
+        self.assertIn("# Report to the originating chat", (self.folder / "reporting.md").read_text(encoding="utf-8"))
+
+    def test_input_root_ignores_itself_and_an_existing_ignore_file_is_kept(self):
+        folder, _ = bake.prepare_input(self.main, "feature", self.worktree, bake.Brief(None, "Do it."))
+        ignore = folder.parent / ".gitignore"
+        self.assertEqual(ignore.read_text(encoding="utf-8"), "*\n")
+        self.assertEqual(mode(ignore), 0o600)
+        self.assertEqual(sorted(path.name for path in folder.parent.iterdir()), [".gitignore", "feature"])
+        ignore.write_text("brief.md\n", encoding="utf-8")
+        bake.prepare_input(self.main, "second", self.main / ".local" / "worktrees" / "second", bake.Brief(None, "Do it."))
+        self.assertEqual(ignore.read_text(encoding="utf-8"), "brief.md\n")
+        self.assertEqual(sorted(path.name for path in folder.parent.iterdir()), [".gitignore", "feature", "second"])
+
+    def test_saved_result_is_never_deleted_on_reuse(self):
+        self.folder.mkdir(parents=True)
+        result = self.folder / "result.md"
+        result.write_text("delivery failed; outcome here\n", encoding="utf-8")
+        (self.folder / "brief.md").write_text("earlier brief\n", encoding="utf-8")
+        message = f"Saved worker result exists: {result}. Preserve it before removing or reusing this bake."
+        with self.assertRaises(RuntimeError) as caught:
+            bake.prepare_input(self.main, "feature", self.worktree, bake.Brief(None, "fresh brief\n"))
+        self.assertEqual(str(caught.exception), message)
+        with self.assertRaises(RuntimeError) as caught:
+            bake.check_input(self.main, "feature")
+        self.assertEqual(str(caught.exception), message)
+        self.assertEqual(sorted(path.name for path in self.folder.iterdir()), ["brief.md", "result.md"])
+        self.assertEqual(result.read_text(encoding="utf-8"), "delivery failed; outcome here\n")
+        self.assertEqual((self.folder / "brief.md").read_text(encoding="utf-8"), "earlier brief\n")
+
+    def test_brief_inside_the_input_dir_is_rejected_and_kept(self):
+        self.folder.mkdir(parents=True)
+        inside = self.folder / "brief.md"
+        inside.write_text("reused brief\n", encoding="utf-8")
+        with self.assertRaises(RuntimeError) as caught:
+            bake.prepare_input(self.main, "feature", self.worktree, bake.Brief(inside, "reused brief\n"))
+        self.assertEqual(
+            str(caught.exception),
+            f"Prompt file is inside the bake input directory: {inside}. Move it outside that directory before starting this bake.",
+        )
+        self.assertEqual(inside.read_text(encoding="utf-8"), "reused brief\n")
+        self.assertEqual([path.name for path in self.folder.iterdir()], ["brief.md"])
+        beside = self.folder.parent / "brief.md"
+        beside.write_text("shared brief\n", encoding="utf-8")
+        _, files = bake.prepare_input(self.main, "feature", self.worktree, bake.Brief(beside, "shared brief\n"))
+        self.assertEqual(files, [beside, self.folder / "reporting.md"])
+        self.assertEqual(beside.read_text(encoding="utf-8"), "shared brief\n")
 
 
 class NewTests(unittest.TestCase):
@@ -395,6 +459,159 @@ class NewTests(unittest.TestCase):
         self.assertEqual(self.fake.calls, [])
         self.assertFalse((self.main / ".local").exists())
 
+    def assert_nothing_created_or_launched(self):
+        self.assertEqual(self.fake.named("git", "worktree", "add"), [])
+        self.assertEqual(self.fake.named("tmux"), [])
+        self.assertFalse((self.main / ".local" / "worktrees").exists())
+
+    def test_saved_result_blocks_reusing_the_name_before_any_side_effect(self):
+        folder = self.folder("feature")
+        folder.mkdir(parents=True)
+        result = folder / "result.md"
+        result.write_text("delivery failed; outcome here\n", encoding="utf-8")
+        message = f"Saved worker result exists: {result}. Preserve it before removing or reusing this bake."
+        for extra in (("-p", "Do it again."), ()):
+            with self.subTest(extra=extra):
+                with mock.patch.dict(os.environ, {"TMUX": "/tmp/tmux-501/default,1,0"}):
+                    with self.assertRaises(RuntimeError) as caught:
+                        bake.new(parse("new", "feature", *extra))
+                self.assertEqual(str(caught.exception), message)
+        self.assert_nothing_created_or_launched()
+        self.assertEqual([path.name for path in folder.iterdir()], ["result.md"])
+        self.assertEqual(result.read_text(encoding="utf-8"), "delivery failed; outcome here\n")
+
+    def test_brief_inside_the_input_dir_is_rejected_before_any_side_effect(self):
+        inside = self.folder("feature") / "brief.md"
+        inside.parent.mkdir(parents=True)
+        inside.write_text("reused brief\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"TMUX": "/tmp/tmux-501/default,1,0"}):
+            with self.assertRaises(RuntimeError) as caught:
+                bake.new(parse("new", "feature", "-P", str(inside)))
+        self.assertEqual(
+            str(caught.exception),
+            f"Prompt file is inside the bake input directory: {inside}. Move it outside that directory before starting this bake.",
+        )
+        self.assert_nothing_created_or_launched()
+        self.assertEqual(inside.read_text(encoding="utf-8"), "reused brief\n")
+
+    def test_input_failure_is_reported_without_a_worktree_or_branch(self):
+        blocker = self.main / ".local" / "bake"
+        blocker.parent.mkdir()
+        blocker.write_text("not a directory\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"TMUX": "/tmp/tmux-501/default,1,0"}):
+            with self.assertRaises(RuntimeError) as caught:
+                bake.new(parse("new", "feature", "-p", "Do it."))
+        self.assertEqual(str(caught.exception), f"Could not prepare worker input: File exists: {blocker}. No worker was started.")
+        self.assertEqual(blocker.read_text(encoding="utf-8"), "not a directory\n")
+        blocker.unlink()
+        with mock.patch.object(bake, "write_private", side_effect=OSError(errno.ENOSPC, "No space left on device")):
+            with mock.patch.dict(os.environ, {"TMUX": "/tmp/tmux-501/default,1,0"}):
+                with self.assertRaises(RuntimeError) as caught:
+                    bake.new(parse("new", "feature", "-p", "Do it."))
+        self.assertEqual(str(caught.exception), "Could not prepare worker input: No space left on device. No worker was started.")
+        self.assert_nothing_created_or_launched()
+        self.assertEqual(list(self.folder("feature").iterdir()), [])
+        with mock.patch.dict(os.environ, {"TMUX": ""}):
+            output = run(bake.new, parse("new", "feature", "-p", "Do it.", "--no-window"))
+        self.assertIn(f"input:    {self.folder('feature')}\n", output)
+        self.assertEqual(sorted(path.name for path in self.folder("feature").iterdir()), ["brief.md", "reporting.md"])
+        self.assertEqual(len(self.fake.named("git", "worktree", "add")), 1)
+
+    def status_checks(self):
+        return self.fake.named("git", "status", "--porcelain", "--untracked-files=all")
+
+    def test_with_changes_checks_the_input_files_before_creating_the_worktree(self):
+        self.fake.tree_status = " M README.md\n"
+        with mock.patch.dict(os.environ, {"TMUX": "/tmp/tmux-501/default,1,0"}):
+            output = run(bake.new, parse("new", "feature", "-p", "Do it.", "--with-changes"))
+        folder = self.folder("feature")
+        self.assertIn("note:     moved uncommitted changes into the worktree\n", output)
+        check = [
+            "git", "status", "--porcelain", "--untracked-files=all", "--",
+            ":(literal).local/bake/feature/brief.md", ":(literal).local/bake/feature/reporting.md",
+        ]
+        self.assertEqual(self.status_checks(), [check])
+        self.assertEqual(self.fake.cwds[self.fake.calls.index(check)], str(self.main))
+        add = self.fake.named("git", "worktree", "add")[0]
+        push = ["git", "stash", "push", "-u", "-m", "bake/feature"]
+        self.assertLess(self.fake.calls.index(check), self.fake.calls.index(add))
+        self.assertLess(self.fake.calls.index(add), self.fake.calls.index(push))
+        self.assertEqual(self.fake.named("git", "stash"), [push, ["git", "stash", "apply"], ["git", "stash", "drop"]])
+        self.assertEqual((folder.parent / ".gitignore").read_text(encoding="utf-8"), "*\n")
+        self.assertEqual(sorted(path.name for path in folder.iterdir()), ["brief.md", "reporting.md"])
+        self.assertEqual(len(self.fake.named("tmux", "send-keys")), 1)
+
+    def test_with_changes_refuses_before_any_side_effect_when_the_input_would_move(self):
+        brief = self.main / "plans" / "brief.md"
+        brief.parent.mkdir(parents=True)
+        brief.write_text("Read the ledger.\n", encoding="utf-8")
+        self.fake.tree_status = " M README.md\n?? plans/brief.md\n"
+        self.fake.input_status = "?? plans/brief.md\n"
+        message = "Bake input files must be ignored before using --with-changes. No changes were moved."
+        for extra in (("-p", "Do it."), ("-P", str(brief))):
+            with self.subTest(extra=extra):
+                with mock.patch.dict(os.environ, {"TMUX": "/tmp/tmux-501/default,1,0"}):
+                    with self.assertRaises(RuntimeError) as caught:
+                        bake.new(parse("new", "feature", *extra, "--with-changes"))
+                self.assertEqual(str(caught.exception), message)
+                self.assertFalse(self.folder("feature").exists())
+        self.assert_nothing_created_or_launched()
+        self.assertEqual(self.fake.named("git", "stash"), [])
+        self.assertEqual(len(self.status_checks()), 2)
+        self.assertEqual(brief.read_text(encoding="utf-8"), "Read the ledger.\n")
+        self.assertEqual((self.main / ".local" / "bake" / ".gitignore").read_text(encoding="utf-8"), "*\n")
+
+    def test_with_changes_checks_only_the_input_files_inside_the_source_checkout(self):
+        outside = tempfile.TemporaryDirectory()
+        self.addCleanup(outside.cleanup)
+        brief = Path(outside.name).resolve() / "brief.md"
+        brief.write_text("Read the ledger.\n", encoding="utf-8")
+        self.fake.tree_status = " M README.md\n"
+        with mock.patch.dict(os.environ, {"TMUX": "/tmp/tmux-501/default,1,0"}):
+            output = run(bake.new, parse("new", "feature", "-P", str(brief), "--with-changes"))
+        self.assertIn("note:     moved uncommitted changes into the worktree\n", output)
+        self.assertEqual(
+            self.status_checks(),
+            [["git", "status", "--porcelain", "--untracked-files=all", "--", ":(literal).local/bake/feature/reporting.md"]],
+        )
+        self.assertEqual(len(self.fake.named("git", "stash", "push")), 1)
+
+    def test_with_changes_from_a_linked_worktree_skips_files_under_the_main_checkout(self):
+        top = self.worktree("other")
+        top.mkdir(parents=True)
+        self.fake.top = str(top)
+        self.fake.tree_status = " M README.md\n"
+        with mock.patch.dict(os.environ, {"TMUX": "/tmp/tmux-501/default,1,0"}):
+            output = run(bake.new, parse("new", "feature", "-p", "Do it.", "--with-changes"))
+        self.assertIn("note:     moved uncommitted changes into the worktree\n", output)
+        self.assertEqual(self.status_checks(), [])
+        push = ["git", "stash", "push", "-u", "-m", "bake/feature"]
+        self.assertEqual(self.fake.cwds[self.fake.calls.index(push)], str(top))
+        self.assertEqual(sorted(path.name for path in self.folder("feature").iterdir()), ["brief.md", "reporting.md"])
+
+    def test_bare_launch_with_changes_has_nothing_to_check(self):
+        self.fake.tree_status = " M README.md\n"
+        with mock.patch.dict(os.environ, {"TMUX": "/tmp/tmux-501/default,1,0"}):
+            output = run(bake.new, parse("new", "feature", "--with-changes"))
+        self.assertIn("note:     moved uncommitted changes into the worktree\n", output)
+        self.assertEqual(self.status_checks(), [])
+        self.assertFalse((self.main / ".local" / "bake").exists())
+
+    def test_failed_worktree_add_removes_only_the_input_files_bake_wrote(self):
+        brief = self.main / "plans" / "brief.md"
+        brief.parent.mkdir(parents=True)
+        brief.write_text("Read the ledger.\n", encoding="utf-8")
+        self.fake.failing = [["git", "worktree", "add"]]
+        for extra in (("-p", "Do it."), ("-P", str(brief))):
+            with self.subTest(extra=extra):
+                with mock.patch.dict(os.environ, {"TMUX": "/tmp/tmux-501/default,1,0"}):
+                    with self.assertRaisesRegex(RuntimeError, "fake command failed: git worktree add"):
+                        bake.new(parse("new", "feature", *extra))
+                self.assertFalse(self.folder("feature").exists())
+        self.assertEqual(len(self.fake.named("git", "worktree", "add")), 2)
+        self.assertEqual(self.fake.named("tmux"), [])
+        self.assertEqual(brief.read_text(encoding="utf-8"), "Read the ledger.\n")
+
 
 class OpenTests(unittest.TestCase):
     def setUp(self):
@@ -439,7 +656,6 @@ class RemoveTests(unittest.TestCase):
         self.folder = self.main / ".local" / "bake" / "feature"
         self.folder.mkdir(parents=True)
         (self.folder / "reporting.md").write_text("report\n", encoding="utf-8")
-        (self.folder / "result.md").write_text("outcome\n", encoding="utf-8")
         self.fake = FakeInvoke(self.main)
         patcher = mock.patch.object(bake, "invoke", self.fake)
         patcher.start()
@@ -465,6 +681,33 @@ class RemoveTests(unittest.TestCase):
             output = run(bake.done, parse("done", "feature"))
         self.assertFalse(self.folder.exists())
         self.assertIn("removed:", output)
+
+    def test_saved_result_blocks_rm_and_done_before_any_side_effect(self):
+        result = self.folder / "result.md"
+        result.write_text("delivery failed; outcome here\n", encoding="utf-8")
+        self.fake.windows = "feature\n"
+        message = f"Saved worker result exists: {result}. Preserve it before removing or reusing this bake."
+        for handler, argv in (
+            (bake.remove, ("rm", "feature")),
+            (bake.remove, ("rm", "feature", "--force")),
+            (bake.done, ("done", "feature", "--force")),
+        ):
+            with self.subTest(argv=argv):
+                with mock.patch.dict(os.environ, {"TMUX": "/tmp/tmux-501/default,1,0"}):
+                    with self.assertRaises(RuntimeError) as caught:
+                        run(handler, parse(*argv))
+                self.assertEqual(str(caught.exception), message)
+        self.assertEqual(self.fake.named("tmux"), [])
+        self.assertEqual(self.fake.named("git", "worktree", "remove"), [])
+        self.assertEqual(self.fake.named("git", "branch"), [])
+        self.assertTrue(self.path.is_dir())
+        self.assertEqual(sorted(path.name for path in self.folder.iterdir()), ["reporting.md", "result.md"])
+        self.assertEqual(result.read_text(encoding="utf-8"), "delivery failed; outcome here\n")
+        result.rename(self.main / "saved-result.md")
+        with mock.patch.dict(os.environ, {"TMUX": ""}):
+            output = run(bake.remove, parse("rm", "feature"))
+        self.assertIn(f"removed:  {self.folder}\n", output)
+        self.assertFalse(self.folder.exists())
 
 
 if __name__ == "__main__":
