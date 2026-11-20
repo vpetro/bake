@@ -37,14 +37,14 @@ Worker sessions are for programming, so `bake new` always starts pi with an
 explicit selector instead of the global default:
 
 ```
-pi --model anthropic/claude-fable-5-1:max
+pi --model anthropic/claude-fable-5-2:high
 ```
 
 The same command goes to the tmux window and into the `next:` line printed
 with `--no-window` or outside tmux. The global pi settings (`defaultModel`,
 `defaultThinkingLevel`, `modelThinkingLevels`) stay for the sessions you open
-by hand, which is how the conversation stays on Astra at medium while workers
-run Fable 5.1 at max.
+by hand, which is how the conversation stays on Astra while workers
+run Fable 5.2 at high.
 
 `--model` overrides the selector for one worker. It takes pi's selector
 syntax, `provider/id[:thinking]`:
@@ -61,13 +61,13 @@ can still switch with `/model` or `/thinking` inside the session.
 
 `bake open` recreates a window without starting pi. `pi -c` resumes the
 directory's last session with the model and thinking level that session
-recorded, so a worker made by `bake new` comes back as Fable 5.1 at max, and
+recorded, so a worker made by `bake new` comes back as Fable 5.2 at high, and
 a session from before this default keeps whatever it saved. To move an older
 worker to the current policy, pass the selector while resuming; the
 command-line selector takes precedence over the saved one:
 
 ```
-pi -c --model anthropic/claude-fable-5-1:max
+pi -c --model anthropic/claude-fable-5-2:high
 ```
 
 ## Setup hooks

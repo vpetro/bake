@@ -19,7 +19,7 @@ SPEC = importlib.util.spec_from_loader("bake", LOADER)
 bake = importlib.util.module_from_spec(SPEC)
 LOADER.exec_module(bake)
 
-DEFAULT = "anthropic/claude-fable-5-1:max"
+DEFAULT = "anthropic/claude-fable-5-2:high"
 OVERRIDE = "openai/gpt-6-astra:medium"
 
 
